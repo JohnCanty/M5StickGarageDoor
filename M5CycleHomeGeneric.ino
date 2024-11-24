@@ -102,6 +102,7 @@ void setupWifi()
     if (count == 2) { //If we have tried 2 times
       ESP.restart(); //Reboot
     }
+  }
   M5.Lcd.setTextColor(TFT_GREEN, TFT_BLACK);
   M5.Lcd.printf("\n****\n");
   M5.Lcd.print("Wifi Status: ");
@@ -112,7 +113,6 @@ void setupWifi()
   client.setServer(mqtt_server, 1883);  //Sets the server details.
   delay(500);
   client.setCallback(callback); //Sets the message callback function.
-  }
 }
 
 void ntpGetLocalTime()//Output current time. 
