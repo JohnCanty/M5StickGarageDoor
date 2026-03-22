@@ -960,8 +960,11 @@ void callback(char* topic, byte* payload, unsigned int length)
  * @brief Ensures the MQTT client is connected, reconnecting as necessary.
  *
  * Uses a randomised client ID to avoid broker-side "client already connected"
- * rejections across reboots.  On a successful connection publishes an "Online"
- * LWT message and re-subscribes to the garage status topic.
+ * rejections across reboots.  The LWT ("Offline", retained) is registered with
+ * the broker during connect() so the broker publishes it automatically if the
+ * TCP connection drops without a clean disconnect.  On a successful connection,
+ * "Online" is published as a retained message to the same topic so any
+ * subscriber (including late-joiners) sees the correct current presence state.
  */
 void reConnect()
 {
@@ -971,11 +974,16 @@ void reConnect()
     drawGpsFixIcon();
     char clientId[24];
     snprintf(clientId, sizeof(clientId), "M5Stack-%04X", (unsigned)random(0xffff));
-    if (client.connect(clientId)) {
+    // Register the LWT with the broker at connect time (QoS 0, retained).
+    // "Offline" will be published automatically if the device disconnects
+    // without calling client.disconnect() (e.g. power loss, crash, TCP drop).
+    if (client.connect(clientId, nullptr, nullptr,
+                       topicLWT, 0, /*retain=*/true, "Offline")) {
       M5.Lcd.setTextColor(TFT_GREEN, TFT_BLACK);
       M5.Lcd.println("OK");
       drawGpsFixIcon();
-      client.publish(topicLWT, "Online");
+      // Publish "Online" retained so late-joining subscribers see current state.
+      client.publish(topicLWT, "Online", /*retain=*/true);
       client.subscribe(mqttGarageSub);
     } else {
       delay(250);
