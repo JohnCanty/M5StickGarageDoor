@@ -51,7 +51,7 @@
 
 // ─── Hardware ─────────────────────────────────────────────────────────────────
 // Physical pin assignments and low-level timing constants.
-constexpr int           RXPin              = 33, TXPin = 32;  // GPS SoftwareSerial
+constexpr int           RXPin              = 33, TXPin = 32;  // GPS SoftwareSerial (primary mapping)
 constexpr int           Relay1             = 26, Relay2 = 25; // Output relay GPIOs
 constexpr uint32_t      GPSBaud            = 9600;            // Fallback / default GPS baud
 constexpr unsigned long GPSDetectTimeoutMs = 1200;            // Per-setting scan window (ms)
@@ -61,6 +61,8 @@ constexpr unsigned long GPSDetectTimeoutMs = 1200;            // Per-setting sca
 constexpr float  speedSP         = 10.0f; // mph  – Relay1 activates when speed is below this
 constexpr double distanceSP      = 500.0; // m    – radius around home that triggers approach logic
 constexpr int    approachCountSP = 3;     // consecutive "getting closer" GPS readings before triggering door
+constexpr unsigned long approachWindowMs = 5UL * 60UL * 1000UL; // 5-minute trend window
+constexpr double approachWindowCloserSP = 20.0;                 // must get >=20 m closer within window
 
 // ─── Time ─────────────────────────────────────────────────────────────────────
 // Pacific Time: UTC-8 standard, +1 h DST.
@@ -83,6 +85,8 @@ static char homeLat[24]       = {};
 static char homeLon[24]       = {};
 static char gpsBaudStr[16]    = {};  // Persisted GPS baud rate (e.g. "38400")
 static char gpsConfigStr[8]   = {};  // Persisted GPS frame config (e.g. "8N1")
+static char gpsRxPinStr[8]    = {};  // Persisted GPS RX pin (e.g. "33")
+static char gpsTxPinStr[8]    = {};  // Persisted GPS TX pin (e.g. "32")
 static char topicLWT[128]     = {};
 static char topicArrived[128] = {};
 
@@ -97,11 +101,17 @@ static float  currentSpeed    = 0.0f;  // Latest GPS speed in mph
 static double currentDistance = 0.0;  // Latest distance from home in metres
 static double lastDistance    = 0.0;  // Previous distance sample for approach detection
 static int    distanceCount   = 0;    // Consecutive closer-to-home GPS readings
+static bool   mode0ApproachGateActive = false; // Enabled when entering Mode 0 from Mode 1 (away=true)
+static bool   mode0WindowInitialized  = false; // True once first valid distance is captured
+static unsigned long mode0WindowStartMs = 0;   // millis() at start of current 5-minute window
+static double mode0WindowStartDistance = 0.0;  // Distance at start of current 5-minute window
 
 // Detected GPS serial parameters – updated by initGpsSerial() and used by
 // getGPSData() for all subsequent reads.
 static uint32_t                  detectedGpsBaud   = GPSBaud;
 static EspSoftwareSerial::Config detectedGpsConfig = SWSERIAL_8N1;
+static int                       activeGpsRxPin    = RXPin;
+static int                       activeGpsTxPin    = TXPin;
 
 // ─── Objects ──────────────────────────────────────────────────────────────────
 // Library object instances.  Declared at file scope so they are accessible
@@ -119,8 +129,10 @@ bool   hasGpsFix();
 void   drawGpsFixIcon();
 const char* gpsConfigName(EspSoftwareSerial::Config config);
 bool   looksLikeNmeaSentence(const char* s);
-bool   tryGpsSerialSetting(uint32_t baud, EspSoftwareSerial::Config cfg, unsigned long ms);
+bool   tryGpsSerialSetting(uint32_t baud, EspSoftwareSerial::Config cfg, unsigned long ms,
+                           int rxPin, int txPin);
 bool   initGpsSerial();
+void   persistDetectedGpsSettings();
 void   setupWifi(bool infiniteRetry = false);
 void   ntpGetLocalTime();
 void   callback(char* topic, byte* payload, unsigned int length);
@@ -217,7 +229,8 @@ static bool decryptLoad(const char* nvKey, char* out, size_t outMax)
  *
  * Opens the "config" namespace in read-only mode, decrypts each field, then
  * builds topicLWT and topicArrived by appending the suffixes to mqttBaseTopic.
- * GPS configuration fields (baud rate, frame format) are also loaded.
+ * GPS configuration fields (baud rate, frame format) are also loaded. The WiFi
+ * password is optional so open networks remain a valid configuration.
  *
  * @return true   All required fields were present and decrypted.
  * @return false  One or more fields were missing; the device should enter the
@@ -225,10 +238,25 @@ static bool decryptLoad(const char* nvKey, char* out, size_t outMax)
  */
 bool loadConfig()
 {
-  preferences.begin("config", true);
+  if (!preferences.begin("config", true)) {
+    wifiSsid[0] = '\0';
+    wifiPass[0] = '\0';
+    mqttServer[0] = '\0';
+    ntpServer[0] = '\0';
+    mqttBaseTopic[0] = '\0';
+    mqttGaragePub[0] = '\0';
+    mqttGarageSub[0] = '\0';
+    homeLat[0] = '\0';
+    homeLon[0] = '\0';
+    gpsBaudStr[0] = '\0';
+    gpsConfigStr[0] = '\0';
+    gpsRxPinStr[0] = '\0';
+    gpsTxPinStr[0] = '\0';
+    return false;
+  }
+  decryptLoad("wpass", wifiPass, sizeof(wifiPass));
   bool ok =
     decryptLoad("wssid", wifiSsid,      sizeof(wifiSsid))      &&
-    decryptLoad("wpass", wifiPass,      sizeof(wifiPass))      &&
     decryptLoad("mqtt",  mqttServer,    sizeof(mqttServer))    &&
     decryptLoad("ntp",   ntpServer,     sizeof(ntpServer))     &&
     decryptLoad("base",  mqttBaseTopic, sizeof(mqttBaseTopic)) &&
@@ -239,6 +267,8 @@ bool loadConfig()
   // GPS configuration is stored unencrypted (non-sensitive)
   preferences.getString("gpsbaud", gpsBaudStr, sizeof(gpsBaudStr));
   preferences.getString("gpsconfig", gpsConfigStr, sizeof(gpsConfigStr));
+  preferences.getString("gpsrx", gpsRxPinStr, sizeof(gpsRxPinStr));
+  preferences.getString("gpstx", gpsTxPinStr, sizeof(gpsTxPinStr));
   preferences.end();
   if (ok) {
     snprintf(topicLWT,     sizeof(topicLWT),     "%sLWT",     mqttBaseTopic);
@@ -274,7 +304,9 @@ void saveConfig(const char* ssid, const char* pass, const char* mqtt,
                 const char* lat,  const char* lon,
                 const char* gpsBaud, const char* gpsConfig)
 {
-  preferences.begin("config", false);
+  if (!preferences.begin("config", false)) {
+    return;
+  }
   encryptStore("wssid", ssid);
   encryptStore("wpass", pass);
   encryptStore("mqtt",  mqtt);
@@ -286,7 +318,42 @@ void saveConfig(const char* ssid, const char* pass, const char* mqtt,
   encryptStore("hlon",  lon);
   preferences.putString("gpsbaud", gpsBaud);
   preferences.putString("gpsconfig", gpsConfig);
+  preferences.putString("gpsrx", String(activeGpsRxPin).c_str());
+  preferences.putString("gpstx", String(activeGpsTxPin).c_str());
   preferences.end();
+}
+
+/**
+ * @brief Persists the last known-good GPS serial settings for future boots.
+ *
+ * Uses a dedicated Preferences instance so GPS settings can be updated even
+ * while the global Preferences object is holding the "lastAction" namespace.
+ */
+void persistDetectedGpsSettings()
+{
+  char gpsBaudLocal[16] = {};
+  char gpsConfigLocal[8] = {};
+  char gpsRxLocal[8] = {};
+  char gpsTxLocal[8] = {};
+  snprintf(gpsBaudLocal, sizeof(gpsBaudLocal), "%lu", detectedGpsBaud);
+  snprintf(gpsConfigLocal, sizeof(gpsConfigLocal), "%s", gpsConfigName(detectedGpsConfig));
+  snprintf(gpsRxLocal, sizeof(gpsRxLocal), "%d", activeGpsRxPin);
+  snprintf(gpsTxLocal, sizeof(gpsTxLocal), "%d", activeGpsTxPin);
+
+  Preferences gpsPrefs;
+  if (!gpsPrefs.begin("config", false)) {
+    return;
+  }
+  gpsPrefs.putString("gpsbaud", gpsBaudLocal);
+  gpsPrefs.putString("gpsconfig", gpsConfigLocal);
+  gpsPrefs.putString("gpsrx", gpsRxLocal);
+  gpsPrefs.putString("gpstx", gpsTxLocal);
+  gpsPrefs.end();
+
+  snprintf(gpsBaudStr, sizeof(gpsBaudStr), "%s", gpsBaudLocal);
+  snprintf(gpsConfigStr, sizeof(gpsConfigStr), "%s", gpsConfigLocal);
+  snprintf(gpsRxPinStr, sizeof(gpsRxPinStr), "%s", gpsRxLocal);
+  snprintf(gpsTxPinStr, sizeof(gpsTxPinStr), "%s", gpsTxLocal);
 }
 
 // ─── Config portal ────────────────────────────────────────────────────────────
@@ -506,7 +573,8 @@ void runConfigPortal()
   M5.Lcd.setTextColor(TFT_GREEN, TFT_BLACK);
   M5.Lcd.println(ip.toString());
   M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Lcd.println("\nBtnA = skip/reboot");
+  M5.Lcd.println("\nBtnA: skip setup");
+  M5.Lcd.println("and reboot");
 
   _cfgServer.on("/",     HTTP_GET,  handleConfigRoot);
   _cfgServer.on("/save", HTTP_POST, handleConfigSave);
@@ -661,14 +729,17 @@ bool looksLikeNmeaSentence(const char* sentence)
  * @param baud       Baud rate to test (e.g. 9600, 38400).
  * @param config     Frame format (e.g. SWSERIAL_8N1).
  * @param timeoutMs  Maximum time to wait for a valid sentence (milliseconds).
+ * @param rxPin      GPIO used as SoftwareSerial RX.
+ * @param txPin      GPIO used as SoftwareSerial TX.
  * @return true      A valid NMEA sentence was received on this setting.
  * @return false     No valid sentence within the timeout window.
  */
-bool tryGpsSerialSetting(uint32_t baud, EspSoftwareSerial::Config config, unsigned long timeoutMs)
+bool tryGpsSerialSetting(uint32_t baud, EspSoftwareSerial::Config config, unsigned long timeoutMs,
+                         int rxPin, int txPin)
 {
   ss.end();
   delay(25);
-  ss.begin(baud, config, RXPin, TXPin, false);
+  ss.begin(baud, config, rxPin, txPin, false);
 
   while (ss.available())
   {
@@ -719,7 +790,8 @@ bool tryGpsSerialSetting(uint32_t baud, EspSoftwareSerial::Config config, unsign
 
 /**
  * @brief Auto-detects the GPS module's serial parameters by scanning a matrix
- *        of baud rates and frame formats, trying the stored configuration first.
+ *        of baud rates and frame formats, trying the stored configuration first
+ *        and testing both normal and swapped RX/TX pin mappings.
  *
  * If gpsBaudStr and gpsConfigStr are non-empty (from a prior successful scan),
  * tryGpsSerialSetting() is called with those values first. If that succeeds or
@@ -743,6 +815,17 @@ bool initGpsSerial()
     SWSERIAL_8O1,
     SWSERIAL_8N2,
   };
+  struct PinMapping { int rxPin; int txPin; const char* label; };
+  static const PinMapping pinMappings[] = {
+    {RXPin, TXPin, "33/32"},
+    {TXPin, RXPin, "32/33"},
+  };
+  const PinMapping* pinOrder[] = {&pinMappings[0], &pinMappings[1]};
+  if (strcmp(gpsRxPinStr, "32") == 0 && strcmp(gpsTxPinStr, "33") == 0)
+  {
+    pinOrder[0] = &pinMappings[1];
+    pinOrder[1] = &pinMappings[0];
+  }
 
   M5.Lcd.println("Scanning GPS...");
 
@@ -754,34 +837,51 @@ bool initGpsSerial()
     else if (strcmp(gpsConfigStr, "8O1") == 0) storedConfig = SWSERIAL_8O1;
     else if (strcmp(gpsConfigStr, "8N2") == 0) storedConfig = SWSERIAL_8N2;
     
-    M5.Lcd.printf("GPS stored %lu %s\n", storedBaud, gpsConfigStr);
-    if (tryGpsSerialSetting(storedBaud, storedConfig, GPSDetectTimeoutMs)) {
-      detectedGpsBaud = storedBaud;
-      detectedGpsConfig = storedConfig;
-      M5.Lcd.printf("GPS OK %lu %s\n", storedBaud, gpsConfigStr);
-      return true;
+    for (const PinMapping* mappingPtr : pinOrder)
+    {
+      const PinMapping& mapping = *mappingPtr;
+      M5.Lcd.printf("GPS stored %lu %s %s\n", storedBaud, gpsConfigStr, mapping.label);
+      if (tryGpsSerialSetting(storedBaud, storedConfig, GPSDetectTimeoutMs,
+                              mapping.rxPin, mapping.txPin)) {
+        detectedGpsBaud = storedBaud;
+        detectedGpsConfig = storedConfig;
+        activeGpsRxPin = mapping.rxPin;
+        activeGpsTxPin = mapping.txPin;
+        persistDetectedGpsSettings();
+        M5.Lcd.printf("GPS OK %lu %s %s\n", storedBaud, gpsConfigStr, mapping.label);
+        return true;
+      }
     }
   }
 
-  for (uint32_t baud : gpsBaudRates)
+  for (const PinMapping* mappingPtr : pinOrder)
   {
-    for (EspSoftwareSerial::Config config : gpsConfigs)
+    const PinMapping& mapping = *mappingPtr;
+    for (uint32_t baud : gpsBaudRates)
     {
-      M5.Lcd.printf("GPS %lu %s\n", static_cast<unsigned long>(baud), gpsConfigName(config));
-
-      if (tryGpsSerialSetting(baud, config, GPSDetectTimeoutMs))
+      for (EspSoftwareSerial::Config config : gpsConfigs)
       {
-        detectedGpsBaud = baud;
-        detectedGpsConfig = config;
-        M5.Lcd.printf("GPS OK %lu %s\n", static_cast<unsigned long>(baud), gpsConfigName(config));
-        return true;
+        M5.Lcd.printf("GPS %lu %s %s\n", static_cast<unsigned long>(baud), gpsConfigName(config), mapping.label);
+
+        if (tryGpsSerialSetting(baud, config, GPSDetectTimeoutMs, mapping.rxPin, mapping.txPin))
+        {
+          detectedGpsBaud = baud;
+          detectedGpsConfig = config;
+          activeGpsRxPin = mapping.rxPin;
+          activeGpsTxPin = mapping.txPin;
+          persistDetectedGpsSettings();
+          M5.Lcd.printf("GPS OK %lu %s %s\n", static_cast<unsigned long>(baud), gpsConfigName(config), mapping.label);
+          return true;
+        }
       }
     }
   }
 
   ss.end();
   delay(25);
-  ss.begin(GPSBaud, SWSERIAL_8N1, RXPin, TXPin, false);
+  activeGpsRxPin = RXPin;
+  activeGpsTxPin = TXPin;
+  ss.begin(GPSBaud, SWSERIAL_8N1, activeGpsRxPin, activeGpsTxPin, false);
   detectedGpsBaud = GPSBaud;
   detectedGpsConfig = SWSERIAL_8N1;
   M5.Lcd.println("GPS fallback 9600 8N1");
@@ -812,7 +912,6 @@ void setup()
   pinMode(Relay1, OUTPUT);
   pinMode(Relay2, OUTPUT);
   digitalWrite(Relay1, LOW); // Relay off; mode 0 loop controls it dynamically
-  preferences.begin("lastAction", false);
 
   // If BtnA held at boot, or no saved config, launch the setup portal
   WiFi.mode(WIFI_STA);
@@ -823,6 +922,8 @@ void setup()
     runConfigPortal(); // never returns – reboots after save
   }
 
+  preferences.begin("lastAction", false);
+
   value = preferences.getUInt("counter", 0);
   away  = preferences.getBool("away", false);
 
@@ -831,6 +932,12 @@ void setup()
     // ── Mode 0: GPS-only – scan for module then enter loop() ──────────────
     M5.Lcd.println("Mode 0: GPS");
     initGpsSerial();
+    // If we just transitioned from mode 1 (away=true), require a measurable
+    // approach trend before auto-open can trigger.
+    mode0ApproachGateActive = away;
+    mode0WindowInitialized = false;
+    mode0WindowStartMs = 0;
+    mode0WindowStartDistance = 0.0;
     drawGpsFixIcon();
     // loop() takes over from here
   }
@@ -1202,8 +1309,36 @@ void loop()
   digitalWrite(Relay1, (currentSpeed < speedSP) ? HIGH : LOW);
 
   // ── Approach-home detection ───────────────────────────────────────────────
+  if (mode0ApproachGateActive && gpsValid)
+  {
+    if (!mode0WindowInitialized)
+    {
+      mode0WindowInitialized = true;
+      mode0WindowStartMs = millis();
+      mode0WindowStartDistance = currentDistance;
+    }
+    else
+    {
+      if (millis() - mode0WindowStartMs >= approachWindowMs)
+      {
+        // Start a new 5-minute trend window.
+        mode0WindowStartMs = millis();
+        mode0WindowStartDistance = currentDistance;
+      }
+
+      const double netCloser = mode0WindowStartDistance - currentDistance;
+      if (netCloser >= approachWindowCloserSP)
+      {
+        mode0ApproachGateActive = false;
+        M5.Lcd.setTextColor(TFT_GREEN, TFT_BLACK);
+        M5.Lcd.println("Approach gate pass");
+        drawGpsFixIcon();
+      }
+    }
+  }
+
   handleDistanceChange();
-  if (gpsValid && currentDistance > 0.0 &&
+  if (gpsValid && !mode0ApproachGateActive && currentDistance > 0.0 &&
       currentDistance < distanceSP &&
       distanceCount >= approachCountSP)
   {
