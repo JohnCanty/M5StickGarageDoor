@@ -61,8 +61,7 @@ constexpr unsigned long GPSDetectTimeoutMs = 1200;            // Per-setting sca
 constexpr float  speedSP         = 10.0f; // mph  – Relay1 activates when speed is below this
 constexpr double distanceSP      = 500.0; // m    – radius around home that triggers approach logic
 constexpr int    approachCountSP = 3;     // consecutive "getting closer" GPS readings before triggering door
-constexpr unsigned long approachWindowMs = 5UL * 60UL * 1000UL; // 5-minute trend window
-constexpr double approachWindowCloserSP = 20.0;                 // must get >=20 m closer within window
+constexpr unsigned long approachWindowMs = 5UL * 60UL * 1000UL; // 5-minute holdoff before mode-switch decisions
 
 // ─── Time ─────────────────────────────────────────────────────────────────────
 // Pacific Time: UTC-8 standard, +1 h DST.
@@ -105,6 +104,8 @@ static bool   mode0ApproachGateActive = false; // Enabled when entering Mode 0 f
 static bool   mode0WindowInitialized  = false; // True once first valid distance is captured
 static unsigned long mode0WindowStartMs = 0;   // millis() at start of current 5-minute window
 static double mode0WindowStartDistance = 0.0;  // Distance at start of current 5-minute window
+static bool   mode0SkipWaitOnBoot    = false;  // Persisted bypass for holdoff after mode0 USB-loss resume
+static bool   mode0UsbWasPresent     = false;  // Previous USB power state for edge detection
 
 // Detected GPS serial parameters – updated by initGpsSerial() and used by
 // getGPSData() for all subsequent reads.
@@ -146,6 +147,7 @@ void   resetCounter(int x);
 void   awayCheck(bool x);
 void   handleDistanceChange();
 void   getGPSData(unsigned long ms);
+bool   isUsbPowerPresent();
 bool   loadConfig();
 void   saveConfig(const char* ssid, const char* pass, const char* mqtt,
                   const char* ntp,  const char* base,
@@ -926,18 +928,26 @@ void setup()
 
   value = preferences.getUInt("counter", 0);
   away  = preferences.getBool("away", false);
+  mode0SkipWaitOnBoot = preferences.getBool("m0skipwait", false);
 
   if (value == 0)
   {
     // ── Mode 0: GPS-only – scan for module then enter loop() ──────────────
     M5.Lcd.println("Mode 0: GPS");
     initGpsSerial();
-    // If we just transitioned from mode 1 (away=true), require a measurable
-    // approach trend before auto-open can trigger.
+    // If we just transitioned from mode 1 (away=true), wait 5 minutes before
+    // mode-switch decisions. A mode0 USB-loss resume bypasses this once.
     mode0ApproachGateActive = away;
+    if (mode0SkipWaitOnBoot)
+    {
+      mode0ApproachGateActive = false;
+      preferences.putBool("m0skipwait", false);
+      mode0SkipWaitOnBoot = false;
+    }
     mode0WindowInitialized = false;
     mode0WindowStartMs = 0;
     mode0WindowStartDistance = 0.0;
+    mode0UsbWasPresent = isUsbPowerPresent();
     drawGpsFixIcon();
     // loop() takes over from here
   }
@@ -1224,6 +1234,12 @@ void resetCounter(int x)  { preferences.putUInt("counter", x); }
 /** @brief Writes the away flag to the "lastAction" NVS namespace. */
 void awayCheck(bool x)    { preferences.putBool("away", x); }
 
+/** @brief Returns true when USB/VBUS power is present. */
+bool isUsbPowerPresent()
+{
+  return M5.Axp.GetVBusVoltage() > 4.0f;
+}
+
 /**
  * @brief Updates the approach-home detection state machine on each GPS fix.
  *
@@ -1289,6 +1305,24 @@ void loop()
 {
   // loop() is only reached in mode 0 (GPS-only). Modes 1 and 2 block in setup().
   M5.update();
+
+  const bool usbPresent = isUsbPowerPresent();
+  if (mode0UsbWasPresent && !usbPresent)
+  {
+    // USB power dropped while in mode 0: persist resume state and power down.
+    resetCounter(0);
+    awayCheck(away);
+    preferences.putBool("m0skipwait", true);
+    M5.Lcd.fillScreen(TFT_BLACK);
+    M5.Lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+    M5.Lcd.println("USB lost");
+    M5.Lcd.println("Saving state...");
+    drawGpsFixIcon();
+    delay(200);
+    restartCleanup(true);
+  }
+  mode0UsbWasPresent = usbPresent;
+
   getGPSData(50);
   drawGpsFixIcon();
 
@@ -1309,7 +1343,7 @@ void loop()
   digitalWrite(Relay1, (currentSpeed < speedSP) ? HIGH : LOW);
 
   // ── Approach-home detection ───────────────────────────────────────────────
-  if (mode0ApproachGateActive && gpsValid)
+  if (mode0ApproachGateActive)
   {
     if (!mode0WindowInitialized)
     {
@@ -1317,23 +1351,12 @@ void loop()
       mode0WindowStartMs = millis();
       mode0WindowStartDistance = currentDistance;
     }
-    else
+    else if (millis() - mode0WindowStartMs >= approachWindowMs)
     {
-      if (millis() - mode0WindowStartMs >= approachWindowMs)
-      {
-        // Start a new 5-minute trend window.
-        mode0WindowStartMs = millis();
-        mode0WindowStartDistance = currentDistance;
-      }
-
-      const double netCloser = mode0WindowStartDistance - currentDistance;
-      if (netCloser >= approachWindowCloserSP)
-      {
-        mode0ApproachGateActive = false;
-        M5.Lcd.setTextColor(TFT_GREEN, TFT_BLACK);
-        M5.Lcd.println("Approach gate pass");
-        drawGpsFixIcon();
-      }
+      mode0ApproachGateActive = false;
+      M5.Lcd.setTextColor(TFT_GREEN, TFT_BLACK);
+      M5.Lcd.println("Approach wait done");
+      drawGpsFixIcon();
     }
   }
 
